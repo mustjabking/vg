@@ -1,0 +1,142 @@
+name: Build MT.BIN
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Obfuscator
+        run: npm install javascript-obfuscator
+
+      - name: Run Packer
+        run: |
+          node - << 'EOF'
+          const fs = require('fs'), path = require('path'), crypto = require('crypto');
+          let obfuscate = null;
+          try { obfuscate = require('javascript-obfuscator').obfuscate; } catch (_) {}
+
+          const SUFFIX = 'script.taqi.ddns.net.google.pk.js';
+          const xorshift32 = s => { s^=s<<13; s>>>=0; s^=s>>>17; s^=s<<5; s>>>=0; return s>>>0; };
+          
+          function makeKeystream(name, salt, seed, len) {
+            let s = (salt ^ 0x9E3779B9) >>> 0;
+            for (let i=0;i<name.length;i++){ s=(s^name.charCodeAt(i))>>>0; s=Math.imul(s,16777619)>>>0; }
+            s = (s ^ (seed * 2654435761)) >>> 0;
+            if (s === 0) s = 0x12345678;
+            const ks = Buffer.alloc(len); let a = s;
+            for (let i=0;i<len;i++){ a = xorshift32(a); ks[i] = a & 0xff; }
+            return ks;
+          }
+          
+          function encode(data, ks, seed) {
+            const o = Buffer.alloc(data.length);
+            for (let i=0;i<data.length;i++){
+              let b = data[i] ^ ks[i];
+              b = ((b<<3)|(b>>>5)) & 0xff;
+              b = (b + ((i*7 + seed) & 0xff)) & 0xff;
+              o[i] = b;
+            }
+            return o;
+          }
+
+          const rndHex = n => crypto.randomBytes(n).toString('hex').toUpperCase();
+          function bloat(code, alias) {
+            const tgt = Math.max(150, code.split('\n').length * 7);
+            const out = [
+              '/* ============================================================',
+              ' *  M.TAQI-STUDIO',
+              ' *  OWNER         : MUHAMMAD TAQI',
+              ' *  DATE OF BIRTH : 25 NOVEMBER 2009',
+              ' *  WEBS          : AVELIA.ONEAPP.DEV | LYRAMOO.PNTR.DEV | TAQI.DDNS.NET',
+              ' * ============================================================ */',
+              ';(function(){',
+              'var _0xW=["AVELIA.ONEAPP.DEV","LYRAMOO.PNTR.DEV","TAQI.DDNS.NET","MUHAMMAD TAQI",' + JSON.stringify(alias) + '];'
+            ];
+            while (out.length < tgt) {
+              const n = '_0x' + rndHex(4);
+              switch (crypto.randomBytes(1)[0] % 4) {
+                case 0: out.push('function '+n+'(a,b){var c=(a^b)>>>0;return ((c<<3)|(c>>>29))>>>0;}'); break;
+                case 1: out.push('var '+n+'=['+[rndHex(2),rndHex(2),rndHex(2)].map(x=>'0x'+x).join(',')+'];'); break;
+                case 2: out.push('function '+n+'(s){return s.split("").reverse().join("");}'); break;
+                default: out.push('/* '+rndHex(8)+' */');
+              }
+            }
+            out.push('void _0xW[0];','})();','\n' + code + '\n');
+            return out.join('\n');
+          }
+
+          function scan(dir) {
+            let files = [];
+            for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+              const full = path.join(dir, e.name);
+              if (e.isDirectory() && !['node_modules', '.git', '.github'].includes(e.name)) files = files.concat(scan(full));
+              else if (e.isFile() && e.name.endsWith('.js') && !['mt-loader.js', 'make-bin.js'].includes(e.name)) {
+                files.push({ src: fs.readFileSync(full, 'utf8'), stem: path.basename(full, '.js') });
+              }
+            }
+            return files;
+          }
+
+          const entries = scan('.');
+          if (!entries.length) { console.log('No .js files found'); process.exit(0); }
+
+          const items = [];
+          for (const e of entries) {
+            const alias = e.stem + '.' + SUFFIX;
+            let code = e.src;
+            if (obfuscate) {
+              try {
+                code = obfuscate(code, { compact: true, controlFlowFlattening: true, stringArray: true, stringArrayEncoding: ['base64'], selfDefending: true }).getObfuscatedCode();
+              } catch (_) {}
+            }
+            const full = Buffer.concat([crypto.randomBytes(32), Buffer.from(bloat(code, alias), 'utf8')]);
+            const seed = crypto.randomBytes(1)[0];
+            items.push({ alias, full, seed, junkLen: 32 });
+            console.log('+ ' + e.stem + ' -> ' + alias);
+          }
+
+          let salt = crypto.randomBytes(4).readUInt32LE(0) >>> 0;
+          if (salt === 0) salt = 0x4D544151;
+          for (const it of items) {
+            it.enc = encode(it.full, makeKeystream(it.alias, salt, it.seed, it.full.length), it.seed);
+          }
+
+          let off = 14 + items.reduce((a, i) => a + 12 + Buffer.byteLength(i.alias), 0);
+          const h = Buffer.alloc(14); h.write('MTB1',0,'ascii'); h[4]=1; h.writeUInt16LE(items.length,8); h.writeUInt32LE(salt,10);
+          
+          const idx = items.map(it => {
+            const nb = Buffer.from(it.alias); const b = Buffer.alloc(12 + nb.length);
+            let o=0; b[o++]=nb.length; nb.copy(b,o); o+=nb.length;
+            b.writeUInt16LE(it.junkLen,o); o+=2; b.writeUInt32LE(it.enc.length,o); o+=4; b.writeUInt32LE(off,o); o+=4; b[o++]=it.seed; off+=it.enc.length; return b;
+          });
+
+          fs.writeFileSync('mt.bin', Buffer.concat([h, ...idx, ...items.map(i => i.enc), crypto.randomBytes(64)]));
+          console.log('mt.bin Created!');
+          EOF
+
+      - name: Commit mt.bin and Delete Source Files
+        run: |
+          git config --global user.name 'GitHub Action'
+          git config --global user.email 'action@github.com'
+          
+          # Delete all .js files except mt-loader.js
+          find . -name "*.js" ! -name "mt-loader.js" ! -path "./node_modules/*" -delete
+          
+          # Add mt.bin and commit
+          git add mt.bin
+          git add -u 
+          git commit -m "Auto-Build: Created mt.bin & Removed source .js files"
+          git push
